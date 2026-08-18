@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Rapprochement sessions — MyCERAN+</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<style>html,body{margin:0;padding:0}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef, useCallback } = React;
+
+
+/* ============================================================
+   RAPPROCHEMENT SESSIONS — Bubble ↔ Dynamics (MyCERAN+)
+   Tout le traitement est local au navigateur. Aucun envoi réseau.
+   Mot de passe : modifier la constante ci-dessous avant publication.
+   ============================================================ */
+const PASSWORD = "ceran-rapprochement-2026";
+
+/* ---------- Design tokens ---------- */
+const T = {
+  bg: "#F4F6F8",
+  panel: "#FFFFFF",
+  ink: "#1B2130",
+  inkSoft: "#5A6478",
+  line: "#E3E7EE",
+  bubble: "#3B4FE0",      // côté Bubble
+  bubbleBg: "#EEF0FD",
+  dyn: "#0E7C6B",         // côté Dynamics
+  dynBg: "#E7F4F1",
+  warn: "#B45309",
+  warnBg: "#FEF3E2",
+  bad: "#B3261E",
+  badBg: "#FCEBEA",
+  ok: "#1C7C3D",
+  okBg: "#E8F5EC",
+  mono: "ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace",
+  sans: "-apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif",
+};
+
+/* ---------- Auto-détection de colonnes ---------- */
+const ID_PATTERNS = [/^unique id$/i, /bubble session id/i, /^session id$/i, /unique/i, /^id$/i];
+const STATUS_PATTERNS = [/^statut/i, /^status$/i, /^booking status$/i, /statut/i, /status/i];
+function detectColumn(headers, patterns) {
+  for (const p of patterns) {
+    const hit = headers.find((h) => p.test(h.trim()));
+    if (hit) return hit;
+  }
+  return "";
+}
+
+/* ---------- Correspondances de statut par défaut (Bubble → Dynamics) ---------- */
+const IGNORE = "__IGNORE__"; // statut Bubble non géré côté Dynamics : exclu du rapprochement
+const PRESET_MAP = [
+  [/^to ?planify$/i, "To Planify"],
+  [/plan/i, "Reserved"],
+  [/r[ée]serv/i, "Reserved"],
+  [/(termin|r[ée]alis|complet|completed)/i, "Completed"],
+  [/annul|cancel/i, "Canceled"],
+  [/report|postpon/i, "Postponed"],
+];
+function presetFor(bubbleStatus, dynStatuses) {
+  const exact = dynStatuses.find((d) => d.toLowerCase() === bubbleStatus.toLowerCase());
+  if (exact) return exact;
+  for (const [re, target] of PRESET_MAP) {
+    if (re.test(bubbleStatus) && dynStatuses.includes(target)) return target;
+  }
+  return "";
+}
+
+const norm = (s) => (s || "").trim();
+
+/* ---------- Petits composants ---------- */
+function Chip({ children, color, bg }) {
+  return (
+    <span style={{
+      display: "inline-block", padding: "2px 8px", borderRadius: 999,
+      fontSize: 12, fontWeight: 600, color, background: bg, whiteSpace: "nowrap",
+    }}>{children}</span>
+  );
+}
+
+function CopyButton({ getText, label = "Copier", style }) {
+  const [state, setState] = useState("idle");
+  return (
+    <button
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(getText());
+          setState("ok");
+        } catch {
+          // Fallback textarea
+          const ta = document.createElement("textarea");
+          ta.value = getText();
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+          setState("ok");
+        }
+        setTimeout(() => setState("idle"), 1600);
+      }}
+      style={{
+        border: `1px solid ${T.line}`, background: state === "ok" ? T.okBg : "#fff",
+        color: state === "ok" ? T.ok : T.ink, borderRadius: 8, padding: "6px 12px",
+        fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: T.sans, ...style,
+      }}
+    >
+      {state === "ok" ? "Copié ✓" : label}
+    </button>
+  );
+}
+
+/* ---------- Zone d'upload + parsing ---------- */
+function FileCard({ side, title, hint, data, setData }) {
+  const inputRef = useRef(null);
+  const [busy, setBusy] = useState(false);
+  const [drag, setDrag] = useState(false);
+  const color = side === "bubble" ? T.bubble : T.dyn;
+  const bg = side === "bubble" ? T.bubbleBg : T.dynBg;
+
+  const handleFile = useCallback((file) => {
+    if (!file) return;
+    setBusy(true);
+    // setTimeout pour laisser l'UI peindre l'état "analyse" avant un gros parse
+    setTimeout(() => {
+      Papa.parse(file, {
+        header: true,
+        skipEmptyLines: "greedy",
+        transformHeader: (h) => h.replace(/^\uFEFF/, "").trim(),
+        complete: (res) => {
+          const headers = (res.meta.fields || []).filter(Boolean);
+          const idCol = detectColumn(headers, ID_PATTERNS);
+          const stCol = detectColumn(headers.filter((h) => h !== idCol), STATUS_PATTERNS);
+          setData({
+            fileName: file.name,
+            rows: res.data,
+            headers,
+            idCol,
+            statusCol: stCol,
+            errors: res.errors?.length || 0,
+          });
+          setBusy(false);
+        },
+        error: () => setBusy(false),
+      });
+    }, 30);
+  }, [setData]);
+
+  return (
+    <div style={{
+      background: T.panel, border: `1px solid ${T.line}`, borderTop: `4px solid ${color}`,
+      borderRadius: 14, padding: 20, flex: 1, minWidth: 300,
+    }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8 }}>
+        <h2 style={{ margin: 0, fontSize: 16, letterSpacing: 0.2, color }}>{title}</h2>
+        {data && <Chip color={color} bg={bg}>{data.rows.length.toLocaleString("fr-FR")} lignes</Chip>}
+      </div>
+      <p style={{ margin: "6px 0 14px", fontSize: 12.5, color: T.inkSoft }}>{hint}</p>
+
+      <div
+        onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
+        onDragLeave={() => setDrag(false)}
+        onDrop={(e) => { e.preventDefault(); setDrag(false); handleFile(e.dataTransfer.files[0]); }}
+        onClick={() => inputRef.current?.click()}
+        style={{
+          border: `1.5px dashed ${drag ? color : T.line}`, background: drag ? bg : "#FAFBFC",
+          borderRadius: 10, padding: "18px 14px", textAlign: "center", cursor: "pointer",
+          transition: "background .15s, border-color .15s",
+        }}
+      >
+        <input ref={inputRef} type="file" accept=".csv,text/csv" style={{ display: "none" }}
+          onChange={(e) => handleFile(e.target.files[0])} />
+        {busy ? (
+          <span style={{ fontSize: 14, color }}>Analyse du fichier…</span>
+        ) : data ? (
+          <span style={{ fontSize: 13.5, fontFamily: T.mono, color: T.ink, wordBreak: "break-all" }}>
+            {data.fileName}
+          </span>
+        ) : (
+          <span style={{ fontSize: 14, color: T.inkSoft }}>
+            Déposer le CSV ici <span style={{ color: T.line }}>|</span> cliquer pour choisir
+          </span>
+        )}
+      </div>
+
+      {data && (
+        <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
+          {["idCol", "statusCol"].map((key) => (
+            <label key={key} style={{ flex: 1, minWidth: 130, fontSize: 11.5, fontWeight: 700, color: T.inkSoft, textTransform: "uppercase", letterSpacing: 0.5 }}>
+              {key === "idCol" ? "Colonne ID" : "Colonne statut"}
+              <select
+                value={data[key]}
+                onChange={(e) => setData({ ...data, [key]: e.target.value })}
+                style={{
+                  display: "block", width: "100%", marginTop: 4, padding: "7px 8px",
+                  border: `1px solid ${data[key] ? T.line : T.bad}`, borderRadius: 8,
+                  fontSize: 13, fontFamily: T.sans, background: "#fff", color: T.ink,
+                }}
+              >
+                <option value="">— choisir —</option>
+                {data.headers.map((h) => <option key={h} value={h}>{h}</option>)}
+              </select>
+            </label>
+          ))}
+        </div>
+      )}
+      {data && (!data.idCol || !data.statusCol) && (
+        <p style={{ margin: "10px 0 0", fontSize: 12.5, color: T.bad }}>
+          Colonne ID ou statut introuvable automatiquement — sélectionner manuellement ci-dessus.
+          Si elles n'existent pas dans le fichier, refaire l'export avec ces champs.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/* ---------- Tableau paginé ---------- */
+function ResultTable({ columns, rows, renderRow, emptyText }) {
+  const [limit, setLimit] = useState(100);
+  if (!rows.length) return <p style={{ fontSize: 13.5, color: T.inkSoft, margin: "10px 0 0" }}>{emptyText}</p>;
+  return (
+    <div style={{ marginTop: 12, overflowX: "auto" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+        <thead>
+          <tr>
+            {columns.map((c) => (
+              <th key={c} style={{
+                textAlign: "left", padding: "8px 10px", fontSize: 11, textTransform: "uppercase",
+                letterSpacing: 0.6, color: T.inkSoft, borderBottom: `2px solid ${T.line}`, whiteSpace: "nowrap",
+              }}>{c}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>{rows.slice(0, limit).map(renderRow)}</tbody>
+      </table>
+      {rows.length > limit && (
+        <button onClick={() => setLimit(limit + 200)} style={{
+          marginTop: 10, border: `1px solid ${T.line}`, background: "#fff", borderRadius: 8,
+          padding: "6px 14px", fontSize: 13, cursor: "pointer", color: T.ink,
+        }}>
+          Afficher plus ({(rows.length - limit).toLocaleString("fr-FR")} restantes)
+        </button>
+      )}
+    </div>
+  );
+}
+
+const cellStyle = { padding: "7px 10px", borderBottom: `1px solid ${T.line}`, verticalAlign: "top" };
+const idStyle = { ...cellStyle, fontFamily: T.mono, fontSize: 12, wordBreak: "break-all" };
+
+/* ============================================================ */
+function App() {
+  const [unlocked, setUnlocked] = useState(false);
+  const [pwd, setPwd] = useState("");
+  const [pwdError, setPwdError] = useState(false);
+  const [bubble, setBubble] = useState(null);
+  const [dyn, setDyn] = useState(null);
+  const [mapping, setMapping] = useState({}); // statut Bubble -> statut Dynamics attendu
+
+  /* ----- index des deux fichiers ----- */
+  const bubbleIndex = useMemo(() => {
+    if (!bubble?.idCol || !bubble?.statusCol) return null;
+    const map = new Map();
+    const dups = [];
+    for (const r of bubble.rows) {
+      const id = norm(r[bubble.idCol]);
+      if (!id) continue;
+      const st = norm(r[bubble.statusCol]);
+      if (map.has(id) && map.get(id) !== st) dups.push({ id, a: map.get(id), b: st });
+      map.set(id, st);
+    }
+    return { map, dups };
+  }, [bubble]);
+
+  const dynIndex = useMemo(() => {
+    if (!dyn?.idCol || !dyn?.statusCol) return null;
+    const map = new Map();
+    const dups = [];
+    for (const r of dyn.rows) {
+      const id = norm(r[dyn.idCol]);
+      if (!id) continue;
+      const st = norm(r[dyn.statusCol]);
+      if (map.has(id) && map.get(id) !== st) dups.push({ id, a: map.get(id), b: st });
+      map.set(id, st);
+    }
+    return { map, dups };
+  }, [dyn]);
+
+  /* ----- statuts distincts + mapping par défaut ----- */
+  const bubbleStatuses = useMemo(() => {
+    if (!bubbleIndex) return [];
+    return [...new Set([...bubbleIndex.map.values()])].filter(Boolean).sort();
+  }, [bubbleIndex]);
+
+  const dynStatuses = useMemo(() => {
+    if (!dynIndex) return [];
+    return [...new Set([...dynIndex.map.values()])].filter(Boolean).sort();
+  }, [dynIndex]);
+
+  const effectiveMapping = useMemo(() => {
+    const m = {};
+    for (const bs of bubbleStatuses) {
+      m[bs] = mapping[bs] !== undefined ? mapping[bs] : presetFor(bs, dynStatuses);
+    }
+    return m;
+  }, [bubbleStatuses, dynStatuses, mapping]);
+
+  /* ----- calcul du rapprochement ----- */
+  const result = useMemo(() => {
+    if (!bubbleIndex || !dynIndex) return null;
+    const mismatches = [];
+    const missingInBubble = [];
+    const missingInDynamics = [];
+    const unmappedStatuses = new Set();
+    let ignoredCount = 0;
+
+    for (const [id, dynSt] of dynIndex.map) {
+      if (!bubbleIndex.map.has(id)) {
+        missingInBubble.push({ id, dynamicsStatus: dynSt });
+      }
+    }
+    for (const [id, bubSt] of bubbleIndex.map) {
+      if (!dynIndex.map.has(id)) {
+        missingInDynamics.push({ id, bubbleStatus: bubSt });
+        continue;
+      }
+      const dynSt = dynIndex.map.get(id);
+      const expected = effectiveMapping[bubSt] || "";
+      if (expected === IGNORE) { ignoredCount += 1; continue; }
+      if (!expected) {
+        // pas de correspondance définie : comparaison brute insensible à la casse
+        if (bubSt.toLowerCase() !== dynSt.toLowerCase()) {
+          mismatches.push({ id, bubbleStatus: bubSt, dynamicsStatus: dynSt });
+          if (bubSt) unmappedStatuses.add(bubSt);
+        }
+      } else if (expected.toLowerCase() !== dynSt.toLowerCase()) {
+        mismatches.push({ id, bubbleStatus: bubSt, dynamicsStatus: dynSt });
+      }
+    }
+    return { mismatches, missingInBubble, missingInDynamics, unmappedStatuses: [...unmappedStatuses], ignoredCount };
+  }, [bubbleIndex, dynIndex, effectiveMapping]);
+
+  const jsonPayload = useMemo(() => {
+    if (!result) return "";
+    return JSON.stringify({
+      generatedAt: new Date().toISOString(),
+      counts: {
+        bubbleSessions: bubbleIndex.map.size,
+        dynamicsSessions: dynIndex.map.size,
+        statusMismatches: result.mismatches.length,
+        missingInBubble: result.missingInBubble.length,
+        missingInDynamics: result.missingInDynamics.length,
+      },
+      statusMismatches: result.mismatches,
+      missingInBubble: result.missingInBubble,
+      missingInDynamics: result.missingInDynamics,
+    }, null, 2);
+  }, [result, bubbleIndex, dynIndex]);
+
+  /* ============ Écran mot de passe ============ */
+  if (!unlocked) {
+    return (
+      <div style={{ minHeight: "100vh", background: T.bg, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: T.sans }}>
+        <form
+          onSubmit={undefined}
+          style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 16, padding: "36px 32px", width: 340, textAlign: "center" }}
+        >
+          <div style={{ fontFamily: T.mono, fontSize: 12, letterSpacing: 2, color: T.inkSoft, marginBottom: 6 }}>MYCERAN+ · OUTIL INTERNE</div>
+          <h1 style={{ margin: "0 0 4px", fontSize: 20, color: T.ink }}>Rapprochement sessions</h1>
+          <p style={{ margin: "0 0 20px", fontSize: 13, color: T.inkSoft }}>Bubble ↔ Dynamics</p>
+          <input
+            type="password"
+            value={pwd}
+            placeholder="Mot de passe"
+            onChange={(e) => { setPwd(e.target.value); setPwdError(false); }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                if (pwd === PASSWORD) setUnlocked(true); else setPwdError(true);
+              }
+            }}
+            style={{
+              width: "100%", boxSizing: "border-box", padding: "10px 12px", fontSize: 15,
+              border: `1.5px solid ${pwdError ? T.bad : T.line}`, borderRadius: 10, outline: "none",
+              fontFamily: T.mono, textAlign: "center",
+            }}
+          />
+          {pwdError && <p style={{ color: T.bad, fontSize: 12.5, margin: "8px 0 0" }}>Mot de passe incorrect.</p>}
+          <button
+            type="button"
+            onClick={() => { if (pwd === PASSWORD) setUnlocked(true); else setPwdError(true); }}
+            style={{
+              marginTop: 16, width: "100%", padding: "10px 0", fontSize: 14, fontWeight: 700,
+              background: T.ink, color: "#fff", border: "none", borderRadius: 10, cursor: "pointer",
+            }}
+          >
+            Entrer
+          </button>
+        </form>
+      </div>
+    );
+  }
+
+  const ready = bubbleIndex && dynIndex;
+
+  /* ============ Dashboard ============ */
+  return (
+    <div style={{ minHeight: "100vh", background: T.bg, fontFamily: T.sans, color: T.ink, padding: "28px 20px 60px" }}>
+      <div style={{ maxWidth: 1080, margin: "0 auto" }}>
+
+        {/* En-tête */}
+        <header style={{ marginBottom: 24 }}>
+          <div style={{ fontFamily: T.mono, fontSize: 11.5, letterSpacing: 2, color: T.inkSoft }}>MYCERAN+ · OUTIL INTERNE · TRAITEMENT 100 % LOCAL</div>
+          <h1 style={{ margin: "6px 0 2px", fontSize: 26 }}>
+            Rapprochement sessions <span style={{ color: T.bubble }}>Bubble</span> ↔ <span style={{ color: T.dyn }}>Dynamics</span>
+          </h1>
+          <p style={{ margin: 0, fontSize: 13.5, color: T.inkSoft }}>
+            Charger les deux exports CSV. Les fichiers restent dans le navigateur, rien n'est envoyé sur un serveur.
+          </p>
+        </header>
+
+        {/* Uploads */}
+        <div style={{ display: "flex", gap: 18, flexWrap: "wrap", marginBottom: 20 }}>
+          <FileCard side="bubble" title="Export Bubble" data={bubble} setData={setBubble}
+            hint="Export App Data des Sessions — doit contenir « unique id » et le champ statut." />
+          <FileCard side="dyn" title="Export Dynamics" data={dyn} setData={setDyn}
+            hint="Export des bookings — doit contenir « Bubble Session ID » et « Booking Status »." />
+        </div>
+
+        {/* Correspondance des statuts */}
+        {ready && bubbleStatuses.length > 0 && (
+          <section style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 20, marginBottom: 20 }}>
+            <h2 style={{ margin: "0 0 4px", fontSize: 15 }}>Correspondance des statuts</h2>
+            <p style={{ margin: "0 0 14px", fontSize: 12.5, color: T.inkSoft }}>
+              Pour chaque statut Bubble, indiquer le statut Dynamics attendu. « — comparaison directe — » compare les libellés tels quels.
+            </p>
+            <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+              {bubbleStatuses.map((bs) => (
+                <div key={bs} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <Chip color={T.bubble} bg={T.bubbleBg}>{bs}</Chip>
+                  <span style={{ color: T.inkSoft }}>→</span>
+                  <select
+                    value={effectiveMapping[bs] || ""}
+                    onChange={(e) => setMapping({ ...mapping, [bs]: e.target.value })}
+                    style={{ padding: "6px 8px", border: `1px solid ${T.line}`, borderRadius: 8, fontSize: 13, background: "#fff", color: T.ink }}
+                  >
+                    <option value="">— comparaison directe —</option>
+                    <option value={IGNORE}>✕ Ignorer (non géré dans Dynamics)</option>
+                    {dynStatuses.map((d) => <option key={d} value={d}>{d}</option>)}
+                  </select>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* Doublons */}
+        {ready && (dynIndex.dups.length > 0 || bubbleIndex.dups.length > 0) && (
+          <section style={{ background: T.warnBg, border: `1px solid ${T.warn}33`, borderRadius: 14, padding: "14px 20px", marginBottom: 20 }}>
+            <strong style={{ fontSize: 13.5, color: T.warn }}>
+              ⚠ IDs en doublon avec statuts contradictoires — {dynIndex.dups.length.toLocaleString("fr-FR")} côté Dynamics, {bubbleIndex.dups.length.toLocaleString("fr-FR")} côté Bubble (dernière occurrence retenue)
+            </strong>
+            <div style={{ marginTop: 8, maxHeight: 140, overflowY: "auto", fontFamily: T.mono, fontSize: 12, color: T.ink }}>
+              {[...dynIndex.dups.map((d) => ({ ...d, src: "Dynamics" })), ...bubbleIndex.dups.map((d) => ({ ...d, src: "Bubble" }))].map((d, i) => (
+                <div key={i}>{d.src} · {d.id} : « {d.a} » vs « {d.b} »</div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* Résultats */}
+        {result && (
+          <>
+            {/* RG 1 : statuts différents */}
+            <section style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 20, marginBottom: 20 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                <h2 style={{ margin: 0, fontSize: 16 }}>
+                  Sessions communes avec statuts différents{" "}
+                  <span style={{ color: result.mismatches.length ? T.bad : T.ok }}>({result.mismatches.length.toLocaleString("fr-FR")})</span>
+                </h2>
+                <CopyButton label="Copier ce bloc JSON" getText={() => JSON.stringify(result.mismatches)} />
+              </div>
+              {result.ignoredCount > 0 && (
+                <p style={{ fontSize: 12.5, color: T.inkSoft, margin: "8px 0 0" }}>
+                  {result.ignoredCount.toLocaleString("fr-FR")} sessions communes exclues du rapprochement (statut Bubble marqué « Ignorer »).
+                </p>
+              )}
+              {result.unmappedStatuses.length > 0 && (
+                <p style={{ fontSize: 12.5, color: T.warn, margin: "8px 0 0" }}>
+                  Statuts Bubble sans correspondance définie (comparés tels quels) : {result.unmappedStatuses.join(", ")}
+                </p>
+              )}
+              <ResultTable
+                columns={["unique id", "Statut Bubble", "Statut Dynamics"]}
+                rows={result.mismatches}
+                emptyText="Aucune divergence de statut — les deux systèmes sont alignés."
+                renderRow={(r) => (
+                  <tr key={r.id}>
+                    <td style={idStyle}>{r.id}</td>
+                    <td style={cellStyle}><Chip color={T.bubble} bg={T.bubbleBg}>{r.bubbleStatus || "—"}</Chip></td>
+                    <td style={cellStyle}><Chip color={T.dyn} bg={T.dynBg}>{r.dynamicsStatus || "—"}</Chip></td>
+                  </tr>
+                )}
+              />
+            </section>
+
+            {/* RG 2 : dans Dynamics mais plus dans Bubble */}
+            <section style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 20, marginBottom: 20 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                <h2 style={{ margin: 0, fontSize: 16 }}>
+                  Présentes dans Dynamics, supprimées de Bubble{" "}
+                  <span style={{ color: result.missingInBubble.length ? T.bad : T.ok }}>({result.missingInBubble.length.toLocaleString("fr-FR")})</span>
+                </h2>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <CopyButton label="Copier les IDs (liste)" getText={() => result.missingInBubble.map((r) => r.id).join(",")} />
+                  <CopyButton label="Copier ce bloc JSON" getText={() => JSON.stringify(result.missingInBubble)} />
+                </div>
+              </div>
+              <p style={{ fontSize: 12.5, color: T.inkSoft, margin: "8px 0 0" }}>
+                « Copier les IDs » produit une liste séparée par des virgules, prête pour le flux DeletedSessions côté Bubble.
+              </p>
+              <ResultTable
+                columns={["unique id", "Statut Dynamics"]}
+                rows={result.missingInBubble}
+                emptyText="Toutes les sessions Dynamics existent encore dans Bubble."
+                renderRow={(r) => (
+                  <tr key={r.id}>
+                    <td style={idStyle}>{r.id}</td>
+                    <td style={cellStyle}><Chip color={T.dyn} bg={T.dynBg}>{r.dynamicsStatus || "—"}</Chip></td>
+                  </tr>
+                )}
+              />
+            </section>
+
+            {/* Bonus : dans Bubble mais pas dans Dynamics */}
+            <section style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 20, marginBottom: 20 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                <h2 style={{ margin: 0, fontSize: 16 }}>
+                  Présentes dans Bubble, absentes de Dynamics{" "}
+                  <span style={{ color: T.inkSoft }}>({result.missingInDynamics.length.toLocaleString("fr-FR")})</span>
+                </h2>
+                <CopyButton label="Copier ce bloc JSON" getText={() => JSON.stringify(result.missingInDynamics)} />
+              </div>
+              <p style={{ fontSize: 12.5, color: T.inkSoft, margin: "8px 0 0" }}>
+                Sessions jamais synchronisées ou créées après l'export Dynamics.
+              </p>
+              <ResultTable
+                columns={["unique id", "Statut Bubble"]}
+                rows={result.missingInDynamics}
+                emptyText="Toutes les sessions Bubble existent dans Dynamics."
+                renderRow={(r) => (
+                  <tr key={r.id}>
+                    <td style={idStyle}>{r.id}</td>
+                    <td style={cellStyle}><Chip color={T.bubble} bg={T.bubbleBg}>{r.bubbleStatus || "—"}</Chip></td>
+                  </tr>
+                )}
+              />
+            </section>
+
+            {/* Export JSON complet */}
+            <section style={{ background: T.ink, borderRadius: 14, padding: 20, color: "#fff" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                <div>
+                  <h2 style={{ margin: 0, fontSize: 16, color: "#fff" }}>JSON complet pour Bubble</h2>
+                  <p style={{ margin: "4px 0 0", fontSize: 12.5, color: "#B9C0D0" }}>
+                    À coller dans le champ multiline de la page super admin — les deux RG y piochent leurs données.
+                  </p>
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <CopyButton label="Copier le JSON" getText={() => jsonPayload} />
+                  <button
+                    onClick={() => {
+                      const blob = new Blob([jsonPayload], { type: "application/json" });
+                      const a = document.createElement("a");
+                      a.href = URL.createObjectURL(blob);
+                      a.download = `rapprochement-sessions-${new Date().toISOString().slice(0, 10)}.json`;
+                      a.click();
+                      URL.revokeObjectURL(a.href);
+                    }}
+                    style={{ border: "1px solid #3A4358", background: "transparent", color: "#fff", borderRadius: 8, padding: "6px 12px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+                  >
+                    Télécharger .json
+                  </button>
+                </div>
+              </div>
+              <pre style={{
+                marginTop: 14, background: "#232A3B", borderRadius: 10, padding: 14,
+                fontFamily: T.mono, fontSize: 11.5, color: "#D7DEEB", maxHeight: 260, overflow: "auto",
+              }}>
+                {jsonPayload.length > 4000 ? jsonPayload.slice(0, 4000) + "\n… (aperçu tronqué — la copie contient tout)" : jsonPayload}
+              </pre>
+            </section>
+          </>
+        )}
+
+        {!ready && (
+          <p style={{ textAlign: "center", fontSize: 13.5, color: T.inkSoft, marginTop: 30 }}>
+            Le rapprochement se lance automatiquement dès que les deux fichiers sont chargés et leurs colonnes identifiées.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
