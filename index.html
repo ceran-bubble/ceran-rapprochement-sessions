@@ -43,6 +43,8 @@ const T = {
   sans: "-apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif",
 };
 
+const fmt = (n) => n.toLocaleString("fr-FR");
+
 /* ---------- Auto-détection de colonnes ---------- */
 const ID_PATTERNS = [/^unique id$/i, /bubble session id/i, /^session id$/i, /unique/i, /^id$/i];
 const STATUS_PATTERNS = [/^statut/i, /^status$/i, /^booking status$/i, /statut/i, /status/i];
@@ -74,6 +76,35 @@ function presetFor(bubbleStatus, dynStatuses) {
 }
 
 const norm = (s) => (s || "").trim();
+
+/* ---------- Construction de l'index ID → statut ---------- */
+// map   : ID → statut (dernière occurrence retenue)
+// multi : tous les IDs présents sur plusieurs lignes, avec le nombre de lignes et les statuts rencontrés
+// dups  : sous-ensemble de multi dont les statuts sont contradictoires (détail des paires)
+function buildIndex(rows, idCol, statusCol) {
+  const map = new Map();
+  const counts = new Map();
+  const statuses = new Map();
+  const dups = [];
+  for (const r of rows) {
+    const id = norm(r[idCol]);
+    if (!id) continue;
+    const st = norm(r[statusCol]);
+    if (map.has(id) && map.get(id) !== st) dups.push({ id, a: map.get(id), b: st });
+    map.set(id, st);
+    counts.set(id, (counts.get(id) || 0) + 1);
+    if (!statuses.has(id)) statuses.set(id, new Set());
+    statuses.get(id).add(st);
+  }
+  const multi = [];
+  for (const [id, n] of counts) {
+    if (n > 1) multi.push({ id, n, statuses: [...statuses.get(id)], contradictory: statuses.get(id).size > 1 });
+  }
+  multi.sort((x, y) => y.n - x.n);
+  const extraRows = multi.reduce((acc, m) => acc + m.n - 1, 0);
+  const contradictoryIds = multi.filter((m) => m.contradictory).length;
+  return { map, dups, multi, extraRows, contradictoryIds };
+}
 
 /* ---------- Petits composants ---------- */
 function Chip({ children, color, bg }) {
@@ -124,6 +155,14 @@ function FileCard({ side, title, hint, data, setData }) {
   const color = side === "bubble" ? T.bubble : T.dyn;
   const bg = side === "bubble" ? T.bubbleBg : T.dynBg;
 
+  // Nombre de sessions distinctes (IDs non vides, dédoublonnés) — différent du nombre de lignes
+  const distinct = useMemo(() => {
+    if (!data?.idCol) return null;
+    const s = new Set();
+    for (const r of data.rows) { const id = norm(r[data.idCol]); if (id) s.add(id); }
+    return s.size;
+  }, [data]);
+
   const handleFile = useCallback((file) => {
     if (!file) return;
     setBusy(true);
@@ -159,7 +198,11 @@ function FileCard({ side, title, hint, data, setData }) {
     }}>
       <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8 }}>
         <h2 style={{ margin: 0, fontSize: 16, letterSpacing: 0.2, color }}>{title}</h2>
-        {data && <Chip color={color} bg={bg}>{data.rows.length.toLocaleString("fr-FR")} lignes</Chip>}
+        {data && (
+          <Chip color={color} bg={bg}>
+            {fmt(data.rows.length)} lignes{distinct !== null && ` · ${fmt(distinct)} sessions distinctes`}
+          </Chip>
+        )}
       </div>
       <p style={{ margin: "6px 0 14px", fontSize: 12.5, color: T.inkSoft }}>{hint}</p>
 
@@ -244,7 +287,7 @@ function ResultTable({ columns, rows, renderRow, emptyText }) {
           marginTop: 10, border: `1px solid ${T.line}`, background: "#fff", borderRadius: 8,
           padding: "6px 14px", fontSize: 13, cursor: "pointer", color: T.ink,
         }}>
-          Afficher plus ({(rows.length - limit).toLocaleString("fr-FR")} restantes)
+          Afficher plus ({fmt(rows.length - limit)} restantes)
         </button>
       )}
     </div>
@@ -253,6 +296,16 @@ function ResultTable({ columns, rows, renderRow, emptyText }) {
 
 const cellStyle = { padding: "7px 10px", borderBottom: `1px solid ${T.line}`, verticalAlign: "top" };
 const idStyle = { ...cellStyle, fontFamily: T.mono, fontSize: 12, wordBreak: "break-all" };
+
+/* ---------- Ligne de synthèse ---------- */
+function SummaryStat({ value, label, color, bg }) {
+  return (
+    <div style={{ flex: 1, minWidth: 160, background: bg, borderRadius: 10, padding: "12px 16px" }}>
+      <div style={{ fontSize: 24, fontWeight: 700, color, lineHeight: 1.1 }}>{fmt(value)}</div>
+      <div style={{ fontSize: 12.5, color: T.inkSoft, marginTop: 4 }}>{label}</div>
+    </div>
+  );
+}
 
 /* ============================================================ */
 function App() {
@@ -263,30 +316,12 @@ function App() {
   /* ----- index des deux fichiers ----- */
   const bubbleIndex = useMemo(() => {
     if (!bubble?.idCol || !bubble?.statusCol) return null;
-    const map = new Map();
-    const dups = [];
-    for (const r of bubble.rows) {
-      const id = norm(r[bubble.idCol]);
-      if (!id) continue;
-      const st = norm(r[bubble.statusCol]);
-      if (map.has(id) && map.get(id) !== st) dups.push({ id, a: map.get(id), b: st });
-      map.set(id, st);
-    }
-    return { map, dups };
+    return buildIndex(bubble.rows, bubble.idCol, bubble.statusCol);
   }, [bubble]);
 
   const dynIndex = useMemo(() => {
     if (!dyn?.idCol || !dyn?.statusCol) return null;
-    const map = new Map();
-    const dups = [];
-    for (const r of dyn.rows) {
-      const id = norm(r[dyn.idCol]);
-      if (!id) continue;
-      const st = norm(r[dyn.statusCol]);
-      if (map.has(id) && map.get(id) !== st) dups.push({ id, a: map.get(id), b: st });
-      map.set(id, st);
-    }
-    return { map, dups };
+    return buildIndex(dyn.rows, dyn.idCol, dyn.statusCol);
   }, [dyn]);
 
   /* ----- statuts distincts + mapping par défaut ----- */
@@ -316,6 +351,7 @@ function App() {
     const missingInDynamics = [];
     const unmappedStatuses = new Set();
     let ignoredCount = 0;
+    let common = 0;
 
     for (const [id, dynSt] of dynIndex.map) {
       if (!bubbleIndex.map.has(id)) {
@@ -327,6 +363,7 @@ function App() {
         missingInDynamics.push({ id, bubbleStatus: bubSt });
         continue;
       }
+      common += 1;
       const dynSt = dynIndex.map.get(id);
       const expected = effectiveMapping[bubSt] || "";
       if (expected === IGNORE) { ignoredCount += 1; continue; }
@@ -340,7 +377,7 @@ function App() {
         mismatches.push({ id, bubbleStatus: bubSt, dynamicsStatus: dynSt });
       }
     }
-    return { mismatches, missingInBubble, missingInDynamics, unmappedStatuses: [...unmappedStatuses], ignoredCount };
+    return { mismatches, missingInBubble, missingInDynamics, unmappedStatuses: [...unmappedStatuses], ignoredCount, common };
   }, [bubbleIndex, dynIndex, effectiveMapping]);
 
   const jsonPayload = useMemo(() => {
@@ -350,6 +387,7 @@ function App() {
       counts: {
         bubbleSessions: bubbleIndex.map.size,
         dynamicsSessions: dynIndex.map.size,
+        commonSessions: result.common,
         statusMismatches: result.mismatches.length,
         missingInBubble: result.missingInBubble.length,
         missingInDynamics: result.missingInDynamics.length,
@@ -413,11 +451,30 @@ function App() {
           </section>
         )}
 
-        {/* Doublons */}
+        {/* Tous les IDs en doublon (même statut ou non) */}
+        {ready && (dynIndex.multi.length > 0 || bubbleIndex.multi.length > 0) && (
+          <section style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: "14px 20px", marginBottom: 20 }}>
+            <strong style={{ fontSize: 13.5 }}>
+              IDs présents sur plusieurs lignes — {fmt(dynIndex.multi.length)} côté Dynamics ({fmt(dynIndex.extraRows)} lignes en trop), {fmt(bubbleIndex.multi.length)} côté Bubble ({fmt(bubbleIndex.extraRows)} lignes en trop)
+            </strong>
+            <p style={{ margin: "4px 0 0", fontSize: 12.5, color: T.inkSoft }}>
+              dont {fmt(dynIndex.contradictoryIds + bubbleIndex.contradictoryIds)} avec statuts contradictoires (détaillés dans l'encadré ci-dessous). Les autres ont le même statut sur toutes leurs lignes et n'affectent pas le rapprochement.
+            </p>
+            <div style={{ marginTop: 8, maxHeight: 220, overflowY: "auto", fontFamily: T.mono, fontSize: 12, color: T.ink }}>
+              {[...dynIndex.multi.map((m) => ({ ...m, src: "Dynamics" })), ...bubbleIndex.multi.map((m) => ({ ...m, src: "Bubble" }))].map((m, i) => (
+                <div key={i} style={{ color: m.contradictory ? T.warn : T.ink }}>
+                  {m.src} · {m.id} · ×{m.n} · {m.statuses.map((x) => x || "—").join(" / ")}{m.contradictory ? " ⚠" : ""}
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* Doublons avec statuts contradictoires */}
         {ready && (dynIndex.dups.length > 0 || bubbleIndex.dups.length > 0) && (
           <section style={{ background: T.warnBg, border: `1px solid ${T.warn}33`, borderRadius: 14, padding: "14px 20px", marginBottom: 20 }}>
             <strong style={{ fontSize: 13.5, color: T.warn }}>
-              ⚠ IDs en doublon avec statuts contradictoires — {dynIndex.dups.length.toLocaleString("fr-FR")} côté Dynamics, {bubbleIndex.dups.length.toLocaleString("fr-FR")} côté Bubble (dernière occurrence retenue)
+              ⚠ IDs en doublon avec statuts contradictoires — {fmt(dynIndex.contradictoryIds)} côté Dynamics, {fmt(bubbleIndex.contradictoryIds)} côté Bubble (dernière occurrence retenue)
             </strong>
             <div style={{ marginTop: 8, maxHeight: 140, overflowY: "auto", fontFamily: T.mono, fontSize: 12, color: T.ink }}>
               {[...dynIndex.dups.map((d) => ({ ...d, src: "Dynamics" })), ...bubbleIndex.dups.map((d) => ({ ...d, src: "Bubble" }))].map((d, i) => (
@@ -430,18 +487,32 @@ function App() {
         {/* Résultats */}
         {result && (
           <>
+            {/* Synthèse */}
+            <section style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 20, marginBottom: 20 }}>
+              <h2 style={{ margin: "0 0 4px", fontSize: 15 }}>Synthèse</h2>
+              <p style={{ margin: "0 0 14px", fontSize: 12.5, color: T.inkSoft }}>
+                Comptage sur les sessions distinctes (IDs dédoublonnés), pas sur les lignes des fichiers.
+                Vérification : communes + Dynamics seules = {fmt(dynIndex.map.size)} sessions Dynamics ; communes + Bubble seules = {fmt(bubbleIndex.map.size)} sessions Bubble.
+              </p>
+              <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                <SummaryStat value={result.common} label="Sessions communes aux deux systèmes" color={T.ink} bg={T.bg} />
+                <SummaryStat value={result.missingInBubble.length} label="Dynamics seules (absentes de Bubble)" color={T.dyn} bg={T.dynBg} />
+                <SummaryStat value={result.missingInDynamics.length} label="Bubble seules (absentes de Dynamics)" color={T.bubble} bg={T.bubbleBg} />
+              </div>
+            </section>
+
             {/* RG 1 : statuts différents */}
             <section style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 14, padding: 20, marginBottom: 20 }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
                 <h2 style={{ margin: 0, fontSize: 16 }}>
                   Sessions communes avec statuts différents{" "}
-                  <span style={{ color: result.mismatches.length ? T.bad : T.ok }}>({result.mismatches.length.toLocaleString("fr-FR")})</span>
+                  <span style={{ color: result.mismatches.length ? T.bad : T.ok }}>({fmt(result.mismatches.length)})</span>
                 </h2>
                 <CopyButton label="Copier ce bloc JSON" getText={() => JSON.stringify(result.mismatches)} />
               </div>
               {result.ignoredCount > 0 && (
                 <p style={{ fontSize: 12.5, color: T.inkSoft, margin: "8px 0 0" }}>
-                  {result.ignoredCount.toLocaleString("fr-FR")} sessions communes exclues du rapprochement (statut Bubble marqué « Ignorer »).
+                  {fmt(result.ignoredCount)} sessions communes exclues du rapprochement (statut Bubble marqué « Ignorer »).
                 </p>
               )}
               {result.unmappedStatuses.length > 0 && (
@@ -468,7 +539,7 @@ function App() {
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
                 <h2 style={{ margin: 0, fontSize: 16 }}>
                   Présentes dans Dynamics, supprimées de Bubble{" "}
-                  <span style={{ color: result.missingInBubble.length ? T.bad : T.ok }}>({result.missingInBubble.length.toLocaleString("fr-FR")})</span>
+                  <span style={{ color: result.missingInBubble.length ? T.bad : T.ok }}>({fmt(result.missingInBubble.length)})</span>
                 </h2>
                 <div style={{ display: "flex", gap: 8 }}>
                   <CopyButton label="Copier les IDs (liste)" getText={() => result.missingInBubble.map((r) => r.id).join(",")} />
@@ -496,7 +567,7 @@ function App() {
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
                 <h2 style={{ margin: 0, fontSize: 16 }}>
                   Présentes dans Bubble, absentes de Dynamics{" "}
-                  <span style={{ color: T.inkSoft }}>({result.missingInDynamics.length.toLocaleString("fr-FR")})</span>
+                  <span style={{ color: T.inkSoft }}>({fmt(result.missingInDynamics.length)})</span>
                 </h2>
                 <CopyButton label="Copier ce bloc JSON" getText={() => JSON.stringify(result.missingInDynamics)} />
               </div>
